@@ -57,6 +57,7 @@ class FuzzUrlParameters:
         # Create output directory if it doesn't exist
         if not os.path.exists(self.output_dir):
             try:
+                # I create the output directory during setup and then never write a single result into it. Every finding lives only in the log stream; the directory is a promise the rest of the class does not keep.
                 os.makedirs(self.output_dir)
                 logging.info(SUCCESS_DIRECTORY_CREATED.format(self.output_dir))
             except OSError as e:
@@ -110,6 +111,7 @@ class FuzzUrlParameters:
         """
 
         parsed_url = urlparse(url)
+        # Splitting each pair on every equals sign means a value that itself contains an equals, like a base64 token, makes the dict build raise ValueError, and nothing in the fuzz loop catches it. The dict also folds repeated parameters into one, so a URL that legitimately carries a name twice is fuzzed as if it carried it once.
         query_params = dict(qp.split("=") for qp in parsed_url.query.split("&") if qp)
 
         if param in query_params:
@@ -137,6 +139,7 @@ class FuzzUrlParameters:
             self.tested_urls.add(url)
 
             # Basic check for XSS
+            # This tests the page, not my payload. Any page that carries its own script tag, which is nearly every page, is flagged as a possible XSS at whatever URL I happened to request, while a reflection of a non script payload earns nothing.
             if "<script>" in response.text.lower():
                 logging.warning(f"Possible XSS vulnerability detected at: {url}")
 
@@ -167,6 +170,7 @@ class FuzzUrlParameters:
             for a_tag in soup.find_all('a', href=True):
                 link = urljoin(url, a_tag['href'])
                 if self.is_same_domain(self.url, link) and link not in self.tested_urls:
+                    # Marking a discovered link as tested here has a side effect in crawl_and_fuzz: the queue loop skips anything already in tested_urls, so a page found by crawling is never itself crawled or fuzzed. Only the seed page is ever processed, however many links this returns.
                     links.append(link)
                     self.tested_urls.add(link)  # Mark as tested
             return links
@@ -182,6 +186,7 @@ class FuzzUrlParameters:
       try:
           base_domain = tldextract.extract(base_url).domain
           target_domain = tldextract.extract(target_url).domain
+          # tldextract's domain field is only the registrable label, without the suffix. example.com and example.co.uk compare equal in my test, and every subdomain of either counts as the same site, so the crawl boundary is wider than the operator likely pictures.
           return base_domain == target_domain
       except Exception as e:
           logging.error(f"Error comparing domains: {e}")
@@ -237,6 +242,7 @@ class FuzzUrlParameters:
             if current_url not in self.tested_urls:
 
                 logging.info(f"Crawling and fuzzing: {current_url}")
+                # In crawl mode this still fuzzes the original URL's parameters, because fuzz_all_parameters reads self.url, not current_url. Each discovered page gets the git and credential checks for its own address, but its own parameters are never fuzzed.
                 self.fuzz_all_parameters()
                 self.check_for_git_directory(current_url)
                 self.check_default_credentials(current_url)
