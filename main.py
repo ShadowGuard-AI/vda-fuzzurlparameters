@@ -1,312 +1,279 @@
 import argparse
-import requests
 import logging
-import re
+import os
+import sys
+import uuid
+from urllib.parse import parse_qsl, urlencode, urlparse
+
+import requests
 from bs4 import BeautifulSoup
 import tldextract
-from urllib.parse import urlparse, urljoin
-import os
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Common attack vectors
 ATTACK_VECTORS = {
-    "xss": ["<script>alert('XSS')</script>", '"<img src=x onerror=alert(\'XSS\')>"', "&lt;script&gt;alert('XSS')&lt;/script&gt;"],
+    "xss": ["<script>alert('XSS')</script>", "\"<img src=x onerror=alert('XSS')>\"", "&lt;script&gt;alert('XSS')&lt;/script&gt;"],
     "sql_injection": ["'", "';", "1=1", "OR 1=1", "--", "/*", "*/"],
     "lfi": ["../etc/passwd", "../../etc/passwd", "/etc/passwd", "....//....//etc/passwd"],
     "open_redirect": ["//evil.com", "http://evil.com", "https://evil.com"],
     "git": ["/.git/config", "/.git/HEAD"],
-    "default_creds": ["admin:admin", "root:root", "user:password"] #Basic check, not comprehensive
+    "default_creds": ["admin:admin", "root:root", "user:password"]
 }
 
-# Error messages
-ERROR_INVALID_URL = "Error: Invalid URL provided."
-ERROR_REQUEST_FAILED = "Error: Request failed for URL: {} with status code: {}"
-ERROR_DIRECTORY_EXISTS = "Error: Directory already exists: {}"
-ERROR_CREATING_DIRECTORY = "Error: Failed to create directory: {}"
-ERROR_PARSING_URL = "Error: Failed to parse URL: {}"
-
-# Success messages
-SUCCESS_DIRECTORY_CREATED = "Successfully created directory: {}"
+SQL_ERROR_MARKERS = ["sql syntax", "sqlite3", "operationalerror", "mysql_fetch", "unclosed quotation mark", "odbc", "syntax error in query"]
+LFI_MARKERS = ["root:x:0:0:", "root:*:0:0:"]
+MAX_PAGES = 50
+MAX_DEPTH = 3
 
 class FuzzUrlParameters:
-    """
-    A class for fuzzing URL parameters to discover potential vulnerabilities.
-    """
-
     def __init__(self, url, output_dir="fuzz_results", crawl=False):
-        """
-        Initializes the FuzzUrlParameters object.
-
-        Args:
-            url (str): The URL to fuzz.
-            output_dir (str): The directory to store the results. Defaults to "fuzz_results".
-            crawl (bool): Whether to crawl the website for more URLs. Defaults to False.
-        """
         self.url = url
         self.output_dir = output_dir
         self.crawl = crawl
-        self.tested_urls = set()  # Keep track of URLs already tested
-        self.session = requests.Session()  # Use session for persistent connections
-
-        # Input Validation
+        self.tested_urls = set()
+        self.session = requests.Session()
+        self.findings = []
+        self.requests_made = 0
+        self.requests_failed = 0
         if not self.is_valid_url(self.url):
-            raise ValueError(ERROR_INVALID_URL)
-
-        # Create output directory if it doesn't exist
+            raise ValueError("Error: Invalid URL provided.")
         if not os.path.exists(self.output_dir):
             try:
-                # I create the output directory during setup and then never write a single result into it. Every finding lives only in the log stream; the directory is a promise the rest of the class does not keep.
                 os.makedirs(self.output_dir)
-                logging.info(SUCCESS_DIRECTORY_CREATED.format(self.output_dir))
-            except OSError as e:
-                logging.error(ERROR_CREATING_DIRECTORY.format(self.output_dir))
-                raise  # Re-raise the exception after logging
-
+                logging.info(f"Successfully created directory: {self.output_dir}")
+            except OSError:
+                logging.error(f"Error: Failed to create directory: {self.output_dir}")
+                raise
         elif not os.path.isdir(self.output_dir):
-            raise OSError(ERROR_DIRECTORY_EXISTS.format(self.output_dir))
-
+            raise OSError(f"Error: Directory already exists as a file: {self.output_dir}")
 
     def is_valid_url(self, url):
-        """
-        Validates the given URL.
-
-        Args:
-            url (str): The URL to validate.
-
-        Returns:
-            bool: True if the URL is valid, False otherwise.
-        """
         try:
             result = urlparse(url)
             return all([result.scheme, result.netloc])
-        except:
+        except Exception:
             return False
 
+    def _record(self, ok):
+        self.requests_made += 1
+        if not ok:
+            self.requests_failed += 1
 
-    def fuzz_parameter(self, url, param, attack_vector):
-        """
-        Fuzzes a single parameter with a given attack vector.
-
-        Args:
-            url (str): The base URL.
-            param (str): The parameter to fuzz.
-            attack_vector (str): The attack vector to use.
-        """
-        fuzzed_url = self.replace_parameter_value(url, param, attack_vector)
-        self.test_url(fuzzed_url)
+    def _get(self, url, **kw):
+        try:
+            resp = self.session.get(url, timeout=10, **kw)
+            self._record(True)
+            return resp
+        except requests.exceptions.RequestException as e:
+            self._record(False)
+            logging.error(f"Request failed for URL: {url}: {e}")
+            return None
 
     def replace_parameter_value(self, url, param, value):
-        """
-        Replaces the value of a parameter in the URL.
-
-        Args:
-            url (str): The URL to modify.
-            param (str): The parameter to replace.
-            value (str): The new value for the parameter.
-
-        Returns:
-            str: The modified URL.
-        """
-
         parsed_url = urlparse(url)
-        # Splitting each pair on every equals sign means a value that itself contains an equals, like a base64 token, makes the dict build raise ValueError, and nothing in the fuzz loop catches it. The dict also folds repeated parameters into one, so a URL that legitimately carries a name twice is fuzzed as if it carried it once.
-        query_params = dict(qp.split("=") for qp in parsed_url.query.split("&") if qp)
+        pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
+        new_pairs = []
+        replaced = False
+        for k, v in pairs:
+            if k == param:
+                new_pairs.append((k, value)); replaced = True
+            else:
+                new_pairs.append((k, v))
+        if not replaced:
+            new_pairs.append((param, value))
+        return parsed_url._replace(query=urlencode(new_pairs)).geturl()
 
-        if param in query_params:
-            query_params[param] = value
-        else:
-            query_params[param] = value
-
-        new_query = "&".join([f"{k}={v}" for k, v in query_params.items()])
-        return parsed_url._replace(query=new_query).geturl()
-
-    def test_url(self, url):
-        """
-        Tests the given URL and logs the response.
-
-        Args:
-            url (str): The URL to test.
-        """
+    def test_url(self, url, payload=None, attack_type=None, baseline_text=None, marker=None):
         if url in self.tested_urls:
-            return # Skip already tested URLs
+            return None
+        self.tested_urls.add(url)
+        response = self._get(url, allow_redirects=True)
+        if response is None:
+            return None
+        logging.info(f"URL: {url} - Status Code: {response.status_code}")
+        body = response.text or ""
+        baseline = baseline_text or ""
+        if attack_type == "xss" and marker:
+            if marker in body and marker not in baseline:
+                msg = f"Possible XSS vulnerability detected at: {url} (unique marker reflected unencoded, absent from baseline)"
+                logging.warning(msg); self.findings.append(msg)
+        elif attack_type == "sql_injection":
+            low, blow = body.lower(), baseline.lower()
+            if any(m in low and m not in blow for m in SQL_ERROR_MARKERS):
+                msg = f"Possible SQL injection vulnerability detected at: {url} (SQL error text in response, absent from baseline)"
+                logging.warning(msg); self.findings.append(msg)
+        elif attack_type == "lfi":
+            if any(m in body and m not in baseline for m in LFI_MARKERS):
+                msg = f"Possible local file inclusion vulnerability detected at: {url} (passwd-style content in response, absent from baseline)"
+                logging.warning(msg); self.findings.append(msg)
+        if response.history:
+            for resp in response.history:
+                msg = f"Possible Open Redirect to: {resp.headers.get('Location')} from {url}"
+                logging.warning(msg)
+        return response
 
-        try:
-            response = self.session.get(url, allow_redirects=True, timeout=10)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            logging.info(f"URL: {url} - Status Code: {response.status_code}")
-            self.tested_urls.add(url)
-
-            # Basic check for XSS
-            # This tests the page, not my payload. Any page that carries its own script tag, which is nearly every page, is flagged as a possible XSS at whatever URL I happened to request, while a reflection of a non script payload earns nothing.
-            if "<script>" in response.text.lower():
-                logging.warning(f"Possible XSS vulnerability detected at: {url}")
-
-            # Basic check for open redirect
-            if response.history:
-                 for resp in response.history:
-                      logging.warning(f"Possible Open Redirect to: {resp.headers.get('Location')} from {url}")
-
-        except requests.exceptions.RequestException as e:
-            logging.error(ERROR_REQUEST_FAILED.format(url, e))
-
+    def fuzz_parameter(self, url, param, attack_vector, attack_type=None, baseline_text=None):
+        marker = None
+        payload = attack_vector
+        if attack_type == "xss":
+            marker = "SGXSS" + uuid.uuid4().hex[:12]
+            payload = f"<script>alert('{marker}')</script>"
+        fuzzed_url = self.replace_parameter_value(url, param, payload)
+        self.test_url(fuzzed_url, payload=payload, attack_type=attack_type, baseline_text=baseline_text, marker=marker)
 
     def discover_links(self, url):
-        """
-        Discovers links on a given webpage.
-
-        Args:
-            url (str): The URL to crawl.
-
-        Returns:
-            list: A list of discovered links.
-        """
-        try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            links = []
-            for a_tag in soup.find_all('a', href=True):
-                link = urljoin(url, a_tag['href'])
-                if self.is_same_domain(self.url, link) and link not in self.tested_urls:
-                    # Marking a discovered link as tested here has a side effect in crawl_and_fuzz: the queue loop skips anything already in tested_urls, so a page found by crawling is never itself crawled or fuzzed. Only the seed page is ever processed, however many links this returns.
-                    links.append(link)
-                    self.tested_urls.add(link)  # Mark as tested
-            return links
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error crawling {url}: {e}")
+        response = self._get(url)
+        if response is None:
             return []
-
+        soup = BeautifulSoup(response.text, 'html.parser')
+        from urllib.parse import urljoin
+        links = []
+        for a_tag in soup.find_all('a', href=True):
+            link = urljoin(url, a_tag['href'])
+            if self.is_same_domain(self.url, link) and link not in links:
+                links.append(link)
+        return links
 
     def is_same_domain(self, base_url, target_url):
-      """
-      Checks if the target URL belongs to the same domain as the base URL.
-      """
-      try:
-          base_domain = tldextract.extract(base_url).domain
-          target_domain = tldextract.extract(target_url).domain
-          # tldextract's domain field is only the registrable label, without the suffix. example.com and example.co.uk compare equal in my test, and every subdomain of either counts as the same site, so the crawl boundary is wider than the operator likely pictures.
-          return base_domain == target_domain
-      except Exception as e:
-          logging.error(f"Error comparing domains: {e}")
-          return False
+        try:
+            b = tldextract.extract(base_url); t = tldextract.extract(target_url)
+            return (b.domain, b.suffix) == (t.domain, t.suffix)
+        except Exception as e:
+            logging.error(f"Error comparing domains: {e}")
+            return False
 
     def check_for_git_directory(self, url):
-        """
-        Checks for the existence of a .git directory.
-        """
-        git_config_url = urljoin(url, ".git/config")
-        self.test_url(git_config_url)
-
+        parsed = urlparse(url)
+        git_config_url = f"{parsed.scheme}://{parsed.netloc}/.git/config"
+        response = self._get(git_config_url)
+        if response is None:
+            return
+        if response.status_code == 200:
+            msg = f"Exposed .git/config found at: {git_config_url}"
+            logging.warning(msg); self.findings.append(msg)
+        else:
+            logging.info(f"No exposed .git/config at site root (status {response.status_code}).")
 
     def check_default_credentials(self, url):
-        """
-        Attempts to authenticate with default credentials (very basic).
-        """
+        baseline = self._get(url)
+        if baseline is None:
+            return
+        base_body = baseline.text or ""
+        base_cookies = set(baseline.cookies.get_dict().keys()) if baseline.cookies else set()
+        base_url_final = baseline.url
         for cred in ATTACK_VECTORS["default_creds"]:
-            user, password = cred.split(":")
+            user, password = cred.split(":", 1)
             try:
                 response = self.session.get(url, auth=(user, password), timeout=10)
-                if response.status_code == 200: # Or another success code
-                    logging.warning(f"Default credentials {user}:{password} worked at {url}")
+                self._record(True)
             except requests.exceptions.RequestException as e:
-                logging.error(f"Error during default credential check at {url}: {e}")
+                self._record(False)
+                logging.error(f"Error during default credential check for user {user} at {url}: {e}")
+                continue
+            new_cookies = set()
+            try:
+                new_cookies = set(response.cookies.get_dict().keys()) - base_cookies
+            except Exception:
+                pass
+            # Also check raw Set-Cookie header for a session cookie the baseline did not set.
+            set_cookie = response.headers.get("Set-Cookie", "")
+            cookie_evidence = bool(new_cookies) or ("session" in set_cookie.lower() and "session" not in (baseline.headers.get("Set-Cookie", "").lower()))
+            redirect_evidence = response.url != base_url_final
+            body_evidence = (response.text or "") != base_body and ("authenticated" in (response.text or "").lower() or "dashboard" in (response.text or "").lower() or "welcome" in (response.text or "").lower())
+            # A differing status alone counts only when the baseline was not already a success page with the same body.
+            status_evidence = response.status_code != baseline.status_code and response.status_code < 400
+            if response.status_code < 400 and (cookie_evidence or redirect_evidence or body_evidence or status_evidence):
+                msg = f"Default credentials for user {user} appear to work at {url} (evidence: cookie={cookie_evidence}, redirect={redirect_evidence}, body={body_evidence}, status_change={status_evidence})"
+                logging.warning(msg); self.findings.append(msg)
+            else:
+                logging.info(f"Default credentials for user {user} did not authenticate at {url}")
 
-    def fuzz_all_parameters(self):
-        """
-        Fuzzes all parameters of the URL with common attack vectors.
-        """
-        parsed_url = urlparse(self.url)
-        query_params = parsed_url.query
-
-        if not query_params:
+    def fuzz_all_parameters(self, url=None):
+        target_url = url or self.url
+        parsed_url = urlparse(target_url)
+        if not parsed_url.query:
             logging.info("No parameters found in the URL.")
             return
-
-        params = dict(qp.split("=") for qp in query_params.split("&") if qp)
-
+        pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
+        params = []
+        for k, _v in pairs:
+            if k not in params: params.append(k)
+        baseline_resp = self._get(target_url)
+        baseline_text = baseline_resp.text if baseline_resp is not None else ""
         for param in params:
             logging.info(f"Fuzzing parameter: {param}")
             for attack_type, vectors in ATTACK_VECTORS.items():
+                if attack_type == "default_creds":
+                    continue
                 for vector in vectors:
-                    self.fuzz_parameter(self.url, param, vector)
+                    self.fuzz_parameter(target_url, param, vector, attack_type=attack_type, baseline_text=baseline_text)
 
     def crawl_and_fuzz(self):
-        """
-        Crawls the website and fuzzes all discovered URLs.
-        """
-        urls_to_crawl = [self.url]
-        while urls_to_crawl:
-            current_url = urls_to_crawl.pop(0) #FIFO for breadth first search
-            if current_url not in self.tested_urls:
+        queue = [(self.url, 0)]
+        seen_pages = set()
+        pages = 0
+        while queue and pages < MAX_PAGES:
+            current_url, depth = queue.pop(0)
+            if current_url in seen_pages:
+                continue
+            seen_pages.add(current_url); pages += 1
+            logging.info(f"Crawling and fuzzing: {current_url}")
+            self.fuzz_all_parameters(current_url)
+            self.check_for_git_directory(current_url)
+            self.check_default_credentials(current_url)
+            if depth < MAX_DEPTH:
+                for link in self.discover_links(current_url):
+                    page_key = link.split("#")[0]
+                    if page_key not in seen_pages and all(page_key != q[0] for q in queue):
+                        queue.append((page_key, depth + 1))
 
-                logging.info(f"Crawling and fuzzing: {current_url}")
-                # In crawl mode this still fuzzes the original URL's parameters, because fuzz_all_parameters reads self.url, not current_url. Each discovered page gets the git and credential checks for its own address, but its own parameters are never fuzzed.
-                self.fuzz_all_parameters()
-                self.check_for_git_directory(current_url)
-                self.check_default_credentials(current_url)
-
-                #Discover new links (crawl)
-                new_links = self.discover_links(current_url)
-                urls_to_crawl.extend(new_links)
-
+    def write_results(self):
+        path = os.path.join(self.output_dir, "results.txt")
+        with open(path, "w") as f:
+            f.write(f"Target: {self.url}\n")
+            f.write(f"Requests made: {self.requests_made}\n")
+            f.write(f"Requests failed: {self.requests_failed}\n")
+            f.write(f"Findings: {len(self.findings)}\n")
+            for finding in self.findings:
+                f.write(f"- {finding}\n")
+        logging.info(f"Results written to {path}")
+        return path
 
     def run(self):
-        """
-        Runs the vulnerability discovery automation.
-        """
         logging.info(f"Starting vulnerability discovery automation for: {self.url}")
-
         if self.crawl:
             self.crawl_and_fuzz()
         else:
             self.fuzz_all_parameters()
             self.check_for_git_directory(self.url)
             self.check_default_credentials(self.url)
-
+        self.write_results()
+        if self.requests_made == 0 or self.requests_failed >= self.requests_made:
+            logging.error("All requests failed; no testing was completed.")
+            return False
         logging.info("Vulnerability discovery automation completed.")
-
-
+        return True
 
 def setup_argparse():
-    """
-    Sets up the argument parser.
-
-    Returns:
-        argparse.ArgumentParser: The argument parser.
-    """
     parser = argparse.ArgumentParser(description='Fuzz URL parameters for vulnerability discovery.')
     parser.add_argument('url', help='The URL to fuzz.')
-    parser.add_argument('-o', '--output', dest='output_dir', default='fuzz_results',
-                        help='The output directory to store results. Defaults to fuzz_results.')
+    parser.add_argument('-o', '--output', dest='output_dir', default='fuzz_results', help='The output directory to store results. Defaults to fuzz_results.')
     parser.add_argument('-c', '--crawl', action='store_true', help='Crawl the website and fuzz discovered URLs.')
     return parser
 
 def main():
-    """
-    Main function to parse arguments and run the fuzzer.
-    """
     parser = setup_argparse()
     args = parser.parse_args()
-
     try:
         fuzzer = FuzzUrlParameters(args.url, args.output_dir, args.crawl)
-        fuzzer.run()
+        ok = fuzzer.run()
     except ValueError as e:
-        logging.error(e)
+        logging.error(e); return 1
     except OSError as e:
-        logging.error(e)
+        logging.error(e); return 1
     except Exception as e:
-        logging.exception("An unexpected error occurred: {}".format(e)) # Using exception to log the full traceback
-
-
+        logging.exception("An unexpected error occurred: {}".format(e)); return 1
+    return 0 if ok else 1
 
 if __name__ == "__main__":
-    main()
-
-# Usage examples:
-# python main.py "http://example.com/page.php?id=1"
-# python main.py "http://example.com/page.php?id=1" -o my_results
-# python main.py "http://example.com/" -c
-# python main.py "http://example.com/page.php?id=1&name=test" -c -o crawl_results
+    sys.exit(main())
